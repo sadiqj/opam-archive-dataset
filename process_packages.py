@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 import os
+
+# read /run/secrets/hf_token in to HF_TOKEN environment variable
+os.environ['HF_TOKEN'] = open('/run/secrets/hf_token').read().strip()
+
 import re
 import tarfile
 import tempfile
