@@ -18,5 +18,6 @@ RUN uv pip install semver pandas pyarrow huggingface_hub datasets tqdm
 COPY process_packages.py /usr/local/bin/process_packages.py
 RUN chmod +x /usr/local/bin/process_packages.py
 
-# Run the script when the container starts
-RUN python3 /usr/local/bin/process_packages.py
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN=$(cat /run/secrets/hf_token) \
+    python3 /usr/local/bin/process_packages.py
