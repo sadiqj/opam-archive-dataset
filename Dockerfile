@@ -19,4 +19,4 @@ COPY process_packages.py /usr/local/bin/process_packages.py
 RUN chmod +x /usr/local/bin/process_packages.py
 
 # Run the script when the container starts
-CMD ["python3", "/usr/local/bin/process_packages.py"]
+RUN python3 /usr/local/bin/process_packages.py
