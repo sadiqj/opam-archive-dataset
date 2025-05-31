@@ -18,77 +18,79 @@ from huggingface_hub import create_repo, upload_file
 
 # Set up logger
 logger = logging.getLogger('package_analyzer')
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO) # Changed default to INFO, can be set by arg
+# Create console handler if not already present (e.g. for multiple calls)
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    # Set console_handler level via argument or default to INFO
+    # formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # console_handler.setFormatter(formatter)
+    # logger.addHandler(console_handler)
 
-# Create console handler
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
+# Matches package names and versions from directory names like:
+# package-name.1.2.3 or package.1.2 or my.package-name.v0.1.0
+PKG_VERSION_RE = re.compile(
+    r"^(?P<name>[a-zA-Z0-9\._\-]+?)\."  # Package name (non-greedy to handle dots in name)
+    r"(?P<v_prefix>v)?"  # Optional 'v' prefix
+    r"(?P<major>[0-9]+)"  # Major version
+    r"(?:\.(?P<minor>[0-9]+))?"  # Optional minor version
+    r"(?:\.(?P<patch>[0-9]+))?"  # Optional patch version
+    r"(?P<suffix>[~\+\-][a-zA-Z0-9\-\._]*)?$"  # Optional suffix (pre-release, build)
+)
 
-# Create formatter
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
 
-# Add handler to logger
-logger.addHandler(console_handler)
+def setup_logging(level=logging.INFO):
+    # Ensure logger is configured only once if this function is called multiple times
+    if not logger.handlers:
+        logger.setLevel(level)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+    else: # If handlers exist, just update their level
+        logger.setLevel(level)
+        for handler in logger.handlers:
+            handler.setLevel(level)
 
-def process_file_in_tbz(tbz_path, processor_func, file_extensions=('ml', 'mli', 'dune', 'h', 'c', 'opam')):
+def process_archive_file(archive_path, processor_func, file_extensions=('ml', 'mli', 'dune', 'h', 'c', 'opam')):
     """
-    Process files in a tbz archive without storing all contents in memory.
-    
-    Args:
-        tbz_path: Path to the tbz file
-        processor_func: Function that processes each file (gets file_type, file_path, content arguments)
-        file_extensions: Tuple of file extensions to look for
+    Process files in a tar archive (tbz, tgz) without storing all contents in memory.
+    Uses 'r:*' to auto-detect compression.
     """
     try:
-        # Open the tbz file
-        with tarfile.open(tbz_path, 'r:bz2') as tar:
-            # Iterate through the members (files) in the archive
+        with tarfile.open(archive_path, 'r:*') as tar: # Auto-detect compression
             for member in tar.getmembers():
-                # Skip directories
                 if not member.isfile():
                     continue
-                    
-                # Get file extension
+                
                 _, ext = os.path.splitext(member.name)
                 ext = ext.lstrip('.')
                 
-                # Special case for dune files (they might not have extension)
                 if os.path.basename(member.name) == 'dune':
                     ext = 'dune'
                 
-                # Check if the file has one of our target extensions
                 if ext in file_extensions:
                     try:
-                        # Extract file contents
                         file_obj = tar.extractfile(member)
                         if file_obj:
                             content = file_obj.read()
-                            # Try to decode as text
                             try:
                                 content = content.decode('utf-8')
                             except UnicodeDecodeError:
-                                # If it fails, store as binary
-                                content = str(content)
-                            
-                            # Process the file and then let it be garbage collected
+                                content = str(content) # Store as string representation of bytes
                             processor_func(ext, member.name, content)
                     except Exception as e:
-                        logger.error(f"Error extracting {member.name} from {tbz_path}: {str(e)}")
-    
+                        logger.error(f"Error extracting {member.name} from {archive_path}: {str(e)}")
+    except tarfile.ReadError as e:
+        logger.error(f"Error reading archive {archive_path} (possibly corrupted or wrong format): {str(e)}")
     except Exception as e:
-        logger.error(f"Error reading {tbz_path}: {str(e)}")
+        logger.error(f"Generic error processing archive {archive_path}: {str(e)}")
 
-def extract_metadata_from_tbz(tbz_path, package_name):
+def extract_metadata_from_archive(archive_path, package_base_name):
     """
-    Extract metadata (license, homepage, dev-repo) from opam files in a tbz file.
-    
-    Args:
-        tbz_path: Path to the tbz file
-        package_name: Name of the package to look for specific opam files
-        
-    Returns:
-        Dictionary with metadata information
+    Extract metadata (license, homepage, dev-repo) from opam files in an archive.
+    Uses 'r:*' to auto-detect compression.
     """
     metadata = {
         "license": "Unknown",
@@ -96,358 +98,277 @@ def extract_metadata_from_tbz(tbz_path, package_name):
         "dev_repo": "Unknown"
     }
     
+    # Regex to find opam files: either 'opam' or 'packagename.opam'
+    # package_base_name should be the part before the version.
+    opam_file_pattern = re.compile(rf"^(?:{re.escape(package_base_name)}\.opam|opam)$")
+
     def process_opam_file(file_type, file_path, content):
-        if file_type == 'opam':
-            # Check if the opam file is for this package
-            base_name = os.path.basename(file_path)
-            if base_name == f"{package_name}.opam" or base_name == "opam":
-                extracted_metadata = extract_metadata_from_opam(content)
-                # Update metadata if values were found
-                for key, value in extracted_metadata.items():
-                    if value != "Unknown":
-                        metadata[key] = value
-    
-    # Only look at opam files to save memory
-    process_file_in_tbz(tbz_path, process_opam_file, file_extensions=('opam',))
-    
+        # Check if the filename (basename) matches 'opam' or 'package_name.opam'
+        if file_type == 'opam' and opam_file_pattern.match(os.path.basename(file_path)):
+            logger.info(f"Processing opam file: {file_path} in archive {archive_path}") # Changed to info
+            # Simple line-by-line parsing for opam fields
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("license:") or line.startswith("license :") : # handles 'license:' and 'license :'
+                    metadata["license"] = line.split(":", 1)[1].strip().strip('"')
+                elif line.startswith("homepage:") or line.startswith("homepage :"):
+                    metadata["homepage"] = line.split(":", 1)[1].strip().strip('"')
+                elif line.startswith("dev-repo:") or line.startswith("dev-repo :"):
+                    metadata["dev_repo"] = line.split(":", 1)[1].strip().strip('"')
+            logger.info(f"Metadata from {file_path}: {metadata}") # Changed to info
+
+    # Use process_archive_file to find and process opam files
+    # We only care about 'opam' extension here for metadata extraction.
+    process_archive_file(archive_path, process_opam_file, file_extensions=('opam',))
     return metadata
 
-def extract_license_from_tbz(tbz_path, package_name):
-    """
-    Extract license information from opam files in a tbz file (legacy function).
-    
-    Args:
-        tbz_path: Path to the tbz file
-        package_name: Name of the package to look for specific opam files
-        
-    Returns:
-        String with license information or "Unknown" if not found
-    """
-    metadata = extract_metadata_from_tbz(tbz_path, package_name)
-    return metadata["license"]
+def get_packages_from_cache(cache_path):
+    packages = {}
+    if not os.path.isdir(cache_path):
+        logger.error(f"Cache directory {cache_path} not found.")
+        return packages
 
-def list_tbz_file_contents(tbz_path, file_extensions=('ml', 'mli', 'dune', 'h', 'c', 'opam')):
-    """
-    List all files with specified extensions in a tbz file without extracting them all.
-    
-    Args:
-        tbz_path: Path to the tbz file
-        file_extensions: Tuple of file extensions to look for
-    
-    Returns:
-        Dictionary with file extensions as keys and lists of matching files as values
-    """
-    result = defaultdict(list)
-    
-    try:
-        # Open the tbz file
-        with tarfile.open(tbz_path, 'r:bz2') as tar:
-            # Iterate through the members (files) in the archive
-            for member in tar.getmembers():
-                # Skip directories
-                if not member.isfile():
-                    continue
-                    
-                # Get file extension
-                _, ext = os.path.splitext(member.name)
-                ext = ext.lstrip('.')
-                
-                # Special case for dune files (they might not have extension)
-                if os.path.basename(member.name) == 'dune':
-                    result['dune'].append(member.name)
-                    continue
-                
-                # Check if the file has one of our target extensions
-                if ext in file_extensions:
-                    result[ext].append(member.name)
-    
-    except Exception as e:
-        logger.error(f"Error reading {tbz_path}: {str(e)}")
-    
-    return result
-
-def find_package_tbz_files(package_dir):
-    """
-    Find all tbz files in the given package directory
-    """
-    tbz_files = []
-    for root, _, files in os.walk(package_dir):
-        for file in files:
-            if file.endswith('.tbz'):
-                tbz_files.append(os.path.join(root, file))
-    return tbz_files
-
-def extract_metadata_from_opam(opam_content):
-    """
-    Extract metadata information from opam file content
-    
-    Args:
-        opam_content: String content of the opam file
-    
-    Returns:
-        Dictionary with metadata information (license, homepage, dev-repo)
-    """
-    metadata = {
-        "license": "Unknown",
-        "homepage": "Unknown",
-        "dev_repo": "Unknown"
-    }
-    
-    # Extract license
-    license_match = re.search(r'license:\s*"([^"]+)"', opam_content)
-    if license_match:
-        metadata["license"] = license_match.group(1)
-    
-    # Extract homepage
-    homepage_match = re.search(r'homepage:\s*"([^"]+)"', opam_content)
-    if homepage_match:
-        metadata["homepage"] = homepage_match.group(1)
-    
-    # Extract dev-repo (git repository)
-    # There are several possible formats for dev-repo in opam files
-    repo_match = re.search(r'dev-repo:\s*"([^"]+)"', opam_content)
-    if repo_match:
-        metadata["dev_repo"] = repo_match.group(1)
-    else:
-        # Try alternative format
-        repo_match = re.search(r'dev-repo:\s*([^\s]+)', opam_content)
-        if repo_match:
-            metadata["dev_repo"] = repo_match.group(1)
-    
-    return metadata
-
-def extract_license_from_opam(opam_content):
-    """
-    Extract license information from opam file content (legacy function)
-    
-    Args:
-        opam_content: String content of the opam file
-    
-    Returns:
-        String with license information or "Unknown" if not found
-    """
-    metadata = extract_metadata_from_opam(opam_content)
-    return metadata["license"]
-
-def create_parquet_file_in_chunks(output_path, get_data_generator, schema=None, chunk_size=1000):
-    """
-    Create a parquet file by writing chunks of data to avoid using too much memory
-    
-    Args:
-        output_path: Path to the output parquet file
-        get_data_generator: Function that returns a generator of data rows
-        schema: Optional pyarrow schema for the data
-        chunk_size: Number of rows per chunk
-    """
-    import os
-    import uuid
-    
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
-    # Write each chunk to a separate temporary parquet file, then combine them
-    temp_files = []
-    total_rows = 0
-    
-    try:
-        # Process each chunk separately
-        for chunk_num, chunk_data in enumerate(get_data_generator(chunk_size)):
-            if not chunk_data:
+    logger.info(f"Scanning cache directory: {cache_path}")
+    dir_count = 0
+    matched_count = 0
+    for dirname in os.listdir(cache_path):
+        dir_count += 1
+        m = PKG_VERSION_RE.match(dirname)
+        if m:
+            matched_count +=1
+            name = m.group("name")
+            if not name: # Prevent empty package names
+                logger.warning(f"Directory '{dirname}' matched pattern but resulted in an empty package name. Skipping.")
                 continue
-                
-            # Convert chunk to DataFrame
-            df_chunk = pd.DataFrame(chunk_data)
-            chunk_rows = len(df_chunk)
-            total_rows += chunk_rows
-            
-            # Write this chunk to a separate temporary file
-            temp_file = f"{output_path}.part_{chunk_num}_{uuid.uuid4().hex[:8]}"
-            logger.info(f"Writing chunk {chunk_num+1} with {chunk_rows} rows to temp file (total: {total_rows})")
-            df_chunk.to_parquet(temp_file, engine='pyarrow', compression='zstd')
-            temp_files.append(temp_file)
-            
-            # Clear memory
-            del df_chunk
-        
-        if temp_files:
-            # Now read and combine all temp parquet files
-            logger.info(f"Combining {len(temp_files)} temporary parquet files...")
-            
-            # Create a schema from the first file to ensure consistency
-            schema = pq.read_schema(temp_files[0])
-            
-            # Create the parquet writer with the schema
-            with pq.ParquetWriter(output_path, schema) as writer:
-                for temp_file in temp_files:
-                    # Read each temp file and write its row groups to the final file
-                    reader = pq.ParquetFile(temp_file)
-                    for i in range(reader.num_row_groups):
-                        row_group = reader.read_row_group(i)
-                        writer.write_table(row_group)
-            
-            # Clean up temp files
-            logger.info("Cleaning up temporary files...")
-            for temp_file in temp_files:
-                try:
-                    os.remove(temp_file)
-                except Exception as e:
-                    logger.warning(f"Could not remove temp file {temp_file}: {e}")
-        else:
-            logger.warning("No data chunks collected to write to parquet file")
-            return False, 0
-    
-    except Exception as e:
-        logger.error(f"Error writing parquet file: {str(e)}")
-        return False, 0
-    
-    return True, total_rows
 
-def list_packages():
-    """
-    List all packages in the /cache/ directory, find the highest version of each,
-    and analyze their tbz files for ml/mli/dune/.h/.c and opam files.
-    """
-    if not os.path.exists('/cache/'):
-        logger.warning("Warning: /cache/ directory not found!")
-        return [], {}, None
-    
-    # Dictionary to track highest version of each package
-    package_versions = defaultdict(list)
-    package_paths = {}  # Store full path to package directories
-    
-    # Walk through the cache directory
-    for root, dirs, files in os.walk('/cache/'):
-        for dir_name in dirs:
-            # Check if directory name matches a versioned package pattern
-            match = re.search(r'(.+?)[._-](\d+\.\d+\.\d+.*)', dir_name)
-            if match:
-                package_name = match.group(1)
-                version_str = match.group(2)
-                full_path = os.path.join(root, dir_name)
-                
-                # Normalize version string to make it compatible with semver
-                # Remove any trailing components that aren't valid semver
-                version_parts = version_str.split('.')
-                if len(version_parts) >= 3:
-                    # Extract the core version x.y.z
-                    core_version = '.'.join(version_parts[:3])
-                    # Add any pre-release or build metadata if present
-                    if len(version_parts) > 3:
-                        extra = '.'.join(version_parts[3:])
-                        if '-' in extra or '+' in extra:
-                            core_version += extra
-                    
-                    try:
-                        # Try to parse as semver
-                        semver.parse(core_version)
-                        package_versions[package_name].append((version_str, core_version, full_path))
-                    except ValueError:
-                        # If parsing fails, just store the original version string
-                        package_versions[package_name].append((version_str, '0.0.0', full_path))
-    
-    # Find highest version for each package
-    unique_packages = {}
-    package_paths = {}
-    
-    for package, versions in package_versions.items():
-        if not versions:
-            continue
+            major = m.group("major")
+            minor = m.group("minor") or "0"
+            patch = m.group("patch") or "0"
+            suffix = m.group("suffix") or ""
             
-        # Sort by semantic version
-        sorted_versions = sorted(versions, key=lambda x: semver.VersionInfo.parse(x[1]) 
-                               if semver.VersionInfo.is_valid(x[1]) else semver.VersionInfo.parse('0.0.0'))
-        
-        # Get the highest version
-        highest_version = sorted_versions[-1][0]  # Original version string
-        highest_version_path = sorted_versions[-1][2]  # Path to the highest version
-        
-        unique_packages[package] = highest_version
-        package_paths[package] = highest_version_path
-    
-    # Now examine the tbz files for each unique package with highest version
-    package_tbz_contents = {}
-    
-    # Create a generator function for parquet data
-    def get_package_files_generator(chunk_size=1000):      
-        for package_batch in batched(tqdm(package_paths.items()), chunk_size):
-            for package, path in package_batch:
-                chunk_data = []
+            version_str_for_parse = f"{major}.{minor}.{patch}{suffix}"
+            if suffix.startswith("~"):
+                version_str_for_parse = f"{major}.{minor}.{patch}-{suffix[1:]}"
+            
+            logger.info(f"Matched directory: '{dirname}'. Name: '{name}', Raw Version parts: M={major},m={minor},p={patch},suf='{suffix}'. Semver attempt: '{version_str_for_parse}'") # Changed to info
 
-                logger.info(f"Processing package: {package}")
-                # Find all tbz files in this package directory
-                tbz_files = find_package_tbz_files(path)
-                version = unique_packages[package]
-                
-                if tbz_files:
-                    package_tbz_contents[package] = {}
-                    
-                    # First pass: just get file listings for display and extract license
-                    for tbz_file in tbz_files:
-                        tbz_filename = os.path.basename(tbz_file)
-                        logger.info(f"Processing tbz file: {tbz_filename}")
-                        
-                        # Get file listing for display
-                        file_contents_listing = list_tbz_file_contents(tbz_file)
-                        package_tbz_contents[package][tbz_filename] = file_contents_listing
-                    
-                    # Extract metadata information from first tbz file (to save memory)
-                    package_metadata = {
-                        "license": "Unknown",
-                        "homepage": "Unknown",
-                        "dev_repo": "Unknown"
+            try:
+                version = semver.VersionInfo.parse(version_str_for_parse)
+                if name not in packages or version > packages[name]["version_info"]:
+                    packages[name] = {
+                        "version_info": version,
+                        "version_str": str(version), # Store the normalized semver string
+                        "dir": dirname # Original directory name, e.g., gstreamer.0.3.0
                     }
-                    
-                    if tbz_files:
-                        package_metadata = extract_metadata_from_tbz(tbz_files[0], package)
-                        logger.info(f"Found metadata for {package}: license={package_metadata['license']}, " 
-                                f"homepage={package_metadata['homepage']}, git repo={package_metadata['dev_repo']}")
-                    
-                    # Second pass: process files one by one to build chunk data
-                    for tbz_file in tbz_files:
-                        tbz_filename = os.path.basename(tbz_file)
-                        logger.info(f"Extracting contents from: {tbz_filename}")
-                        
-                        # Process each file in the tbz file and add to current chunk
-                        def process_file_for_parquet(file_type, file_path, content):
-                            nonlocal chunk_data
-                            
-                            chunk_data.append({
-                                'package_name': package,
-                                'version': version,
-                                'license': package_metadata['license'],
-                                'homepage': package_metadata['homepage'],
-                                'dev_repo': package_metadata['dev_repo'],
-                                'file_type': file_type,
-                                'file_path': file_path,
-                                'file_contents': content
-                            })
-                        
-                        # Process the tbz file
-                        process_file_in_tbz(tbz_file, process_file_for_parquet)
-                        
-                    yield from chunk_data
-    
-    return unique_packages, package_tbz_contents, get_package_files_generator
+                    logger.info(f"Accepted/Updated package: {name} with version {str(version)} from dir {dirname}") # Changed to info
+            except ValueError:
+                logger.warning(f"Could not parse version '{version_str_for_parse}' for package '{name}' from dir '{dirname}'. Skipping this directory.")
+        # else:
+            # logger.debug(f"Directory '{dirname}' did not match package pattern.") # This can remain debug as it's very verbose
+            
+    logger.info(f"Scanned {dir_count} directories, {matched_count} matched package pattern.")
+    logger.info(f"Found {len(packages)} unique highest package versions.")
+    if packages:
+        logger.info(f"First 5 packages found (name, info): {list(packages.items())[:5]}") # Changed to info
+    return packages
 
-def main():
-    logger.info("Scanning /cache/ directory for packages...")
-    unique_packages, package_tbz_contents, get_data_generator = list_packages()
+def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', batch_size=1000, log_level_str="INFO"):
+    log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+    setup_logging(log_level)
+
+    logger.info(f"Starting package processing. Cache: {cache_path}, Output: {output_dir}, Batch: {batch_size}")
     
-    if not unique_packages:
-        logger.warning("No packages found in /cache/ directory.")
+    packages_to_process = get_packages_from_cache(cache_path)
+    
+    if not packages_to_process:
+        logger.warning("No packages found to process after scanning cache. Exiting.")
         return
-    
-    logger.info(f"Found {len(unique_packages)} unique packages with their highest versions:")
 
-    if get_data_generator:
-        ds = Dataset.from_generator(get_data_generator)
+    logger.info(f"Total unique package versions selected for processing: {len(packages_to_process)}")
 
-        logger.info(f"Dataset created with {len(ds)} rows.")
+    package_data = []
+    processed_count = 0
+    skipped_no_archive_count = 0
+    skipped_empty_archive_count = 0
 
+    for package_name, package_info in tqdm(packages_to_process.items(), desc="Processing packages"):
+        # Log the package key and its associated info (which includes the directory name)
+        logger.info(f"Loop iteration for package key: '{package_name}'. Associated info from cache scan: {package_info}")
+
+        version_str = package_info["version_str"]
+        package_dir_name = package_info["dir"] # This is the original directory name like 'gstreamer.0.3.0'
+        
+        logger.info(f"Starting processing for package: {package_name} (version: {version_str}, specific source dir in cache: {package_dir_name})")
+
+        current_package_contents = []
+        package_metadata = {
+            "license": "Unknown", "homepage": "Unknown", "dev_repo": "Unknown",
+            "processed_opam_file_for_metadata": False
+        }
+
+        package_version_full_path = os.path.join(cache_path, package_dir_name)
+        
+        # Log the contents of the package version directory
+        if os.path.isdir(package_version_full_path):
+            try:
+                dir_contents = os.listdir(package_version_full_path)
+                logger.info(f"Contents of directory {package_version_full_path}: {dir_contents}")
+            except OSError as e:
+                logger.error(f"Could not list contents of directory {package_version_full_path}: {e}")
+        else:
+            logger.warning(f"Package directory {package_version_full_path} not found or is not a directory when trying to list contents.")
+
+        # Glob for .tbz and .tgz files
+        archive_files = glob.glob(os.path.join(package_version_full_path, '*.tbz'))
+        archive_files.extend(glob.glob(os.path.join(package_version_full_path, '*.tgz')))
+
+        if not archive_files:
+            logger.warning(f"No .tbz or .tgz archives found in {package_version_full_path} for package {package_name} {version_str}. This package version will be skipped.")
+            package_data.append({
+                "package_name": package_name, "version": version_str,
+                "license": "Skipped", "homepage": "Skipped", "dev_repo": "Skipped",
+                "files": [], "error": "No .tbz or .tgz archive found"
+            })
+            skipped_no_archive_count += 1
+            continue
+
+        logger.info(f"Found {len(archive_files)} archive(s) in {package_version_full_path}: {archive_files}")
+
+        for archive_path in archive_files:
+            logger.info(f"Processing archive file: {archive_path} for package {package_name} {version_str}")
+
+            archive_name_for_meta_lookup = package_name # Default to package_name from directory
+            archive_filename_base = os.path.basename(archive_path)
+            # Try to parse archive filename for a more accurate metadata package name hint
+            # Regex: (name_part)[-._v](version_part_digits...)
+            # Captures the part before a version-like string in the archive filename.
+            # e.g., "package-name-1.2.3.tar.gz" -> "package-name"
+            # e.g., "h2-0.13.0.tbz" -> "h2"
+            meta_name_match = re.match(r"^(.*?)(?:[._-](?:v\d|\d))", archive_filename_base)
+            if meta_name_match:
+                potential_name_from_archive = meta_name_match.group(1)
+                if potential_name_from_archive and potential_name_from_archive != package_name:
+                    logger.info(f"Archive filename '{archive_filename_base}' suggests base name '{potential_name_from_archive}' for metadata lookup, differing from dir-derived name '{package_name}'. Using '{potential_name_from_archive}' for opam file lookup within this archive.")
+                    archive_name_for_meta_lookup = potential_name_from_archive
+                elif not potential_name_from_archive:
+                    logger.warning(f"Could not reliably determine base name from archive '{archive_filename_base}' for metadata. Defaulting to dir-derived name '{package_name}'.")
+
+            if not package_metadata["processed_opam_file_for_metadata"]:
+                current_archive_metadata = extract_metadata_from_archive(archive_path, archive_name_for_meta_lookup)
+                if any(current_archive_metadata[k] != "Unknown" for k in ["license", "homepage", "dev_repo"]):
+                    package_metadata.update(current_archive_metadata)
+                    package_metadata["processed_opam_file_for_metadata"] = True
+                    logger.info(f"Updated metadata (source: {archive_name_for_meta_lookup}.opam or opam in {archive_filename_base}): License='{package_metadata['license']}', Homepage='{package_metadata['homepage']}', DevRepo='{package_metadata['dev_repo']}'")
+                else:
+                    logger.info(f"No new metadata found in opam file (related to '{archive_name_for_meta_lookup}') within {archive_filename_base}")
+            
+            # Define a collector function for this archive's contents
+            def content_collector(file_type, file_path_in_archive, content):
+                current_package_contents.append({
+                    "file_type": file_type,
+                    "file_path": file_path_in_archive, # Path within the archive
+                    "content": content
+                })
+
+            logger.info(f"Extracting contents from: {archive_path}") # Changed to info
+            process_archive_file(archive_path, content_collector)
+        
+        # After processing all archives for this package version
+        if not current_package_contents:
+            logger.warning(f"No processable files (ml, mli, etc.) found in any archives for {package_name} {version_str} in {package_version_full_path}.")
+            # Still add an entry, it might have metadata, or we need to record it was empty
+            package_data.append({
+                "package_name": package_name, "version": version_str,
+                "license": package_metadata["license"], "homepage": package_metadata["homepage"], "dev_repo": package_metadata["dev_repo"],
+                "files": [], "error": "Archives found but contained no processable files"
+            })
+            skipped_empty_archive_count +=1
+        else:
+            package_data.append({
+                "package_name": package_name, "version": version_str,
+                "license": package_metadata["license"], "homepage": package_metadata["homepage"], "dev_repo": package_metadata["dev_repo"],
+                "files": current_package_contents
+            })
+            processed_count +=1
+            logger.info(f"Finished processing for {package_name} {version_str}. Total files extracted: {len(current_package_contents)}")
+
+    logger.info(f"Finished processing all packages. Successfully processed: {processed_count}, Skipped (no archive): {skipped_no_archive_count}, Skipped (empty/no processable files): {skipped_empty_archive_count}")
+
+    # Convert to Hugging Face Dataset
+    if not package_data:
+        logger.warning("No data collected from packages. Skipping dataset creation and upload.")
+        return
+
+    # Create output directory if it doesn't exist
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        logger.info(f"Created output directory: {output_dir}")
+
+    # Convert list of dicts to a dict of lists for Dataset.from_dict
+    # Handle potential missing 'error' key
+    data_dict = defaultdict(list)
+    for item in package_data:
+        data_dict["package_name"].append(item.get("package_name"))
+        data_dict["version"].append(item.get("version"))
+        data_dict["license"].append(item.get("license"))
+        data_dict["homepage"].append(item.get("homepage"))
+        data_dict["dev_repo"].append(item.get("dev_repo"))
+        data_dict["files"].append(item.get("files")) # files is a list of dicts
+        data_dict["error"].append(item.get("error", None)) # Add error field, default to None
+
+    try:
+        dataset = Dataset.from_dict(data_dict)
+        logger.info(f"Successfully created Hugging Face Dataset. Number of rows: {len(dataset)}")
+    except Exception as e:
+        logger.error(f"Failed to create Hugging Face Dataset: {e}")
+        # Fallback or detailed logging for why from_dict failed
+        logger.error("Data structure that failed:")
+        for key, value_list in data_dict.items():
+            logger.error(f"  {key}: list of {len(value_list)} items. First item type: {type(value_list[0]) if value_list else 'N/A'}")
+            if key == "files" and value_list and isinstance(value_list[0], list) and value_list[0]:
+                 logger.error(f"    First item in 'files' list is a list of {len(value_list[0])} dicts. Keys of first dict: {value_list[0][0].keys() if value_list[0] else 'N/A'}")
+        return
+
+
+    # Save to Parquet in batches
+    # Calculate number of batches
+    num_batches = (len(dataset) + batch_size - 1) // batch_size
+    logger.info(f"Preparing to save dataset in {num_batches} Parquet batch(es) of size {batch_size}.")
+
+    for i in range(num_batches):
+        batch_dataset = dataset.shard(num_shards=num_batches, index=i)
+        parquet_file_path = os.path.join(output_dir, f"opam_packages_batch_{i}.parquet")
+        try:
+            # Convert to pandas DataFrame first for more control or direct save if supported well
+            # df = batch_dataset.to_pandas()
+            # table = pa.Table.from_pandas(df)
+            # pq.write_table(table, parquet_file_path)
+            batch_dataset.to_parquet(parquet_file_path) # Simpler if it works
+            logger.info(f"Successfully saved batch {i} to {parquet_file_path}")
+        except Exception as e:
+            logger.error(f"Error saving batch {i} to Parquet: {str(e)}")
+            # Consider alternative saving or logging more details
+            # logger.error(f"Data for batch {i}: {batch_dataset.to_dict()}")
+
+    try:
         destination_dataset = "sadiqj/opam-archive-dataset"
+        logger.info(f"Pushing dataset to Hugging Face Hub at {destination_dataset}")
+        dataset.push_to_hub(destination_dataset)
+        logger.info(f"Successfully pushed dataset to {destination_dataset}")
+    except Exception as e:
+        logger.error(f"Failed to push dataset to Hugging Face Hub: {e}")
 
-        ds.push_to_hub(destination_dataset)
-    else:
-        logger.warning("No data generator available for Parquet file")
+    logger.info("Package processing and Parquet export complete.")
 
-if __name__ == "__main__":
-    main()
+
+if __name__ == '__main__':
+    # Example: allow setting log level from command line, defaulting to INFO
+    import argparse
+    parser = argparse.ArgumentParser(description="Process OCaml packages from archives.")
+    parser.add_argument("--cache_path", default="/cache/", help="Path to the cache directory.")
+    parser.add_argument("--output_dir", default="/root/opam-archive-dataset/data", help="Directory to save Parquet files.")
+    parser.add_argument("--batch_size", type=int, default=1000, help="Number of package files per Parquet batch.")
+    parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Set the logging level.")
+    args = parser.parse_args()
+
+    main(cache_path=args.cache_path, output_dir=args.output_dir, batch_size=args.batch_size, log_level_str=args.log_level)
