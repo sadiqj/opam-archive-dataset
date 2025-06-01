@@ -189,24 +189,44 @@ def get_packages_from_cache(cache_path):
             suffix = m.group("suffix") or ""
             
             version_str_for_parse = f"{major}.{minor}.{patch}{suffix}"
-            if suffix.startswith("~"):
+            if suffix.startswith("~"): # semver library expects '-' for pre-release, not '~'
                 version_str_for_parse = f"{major}.{minor}.{patch}-{suffix[1:]}"
             
-            logger.info(f"Matched directory: '{dirname}'. Name: '{name}', Raw Version parts: M={major},m={minor},p={patch},suf='{suffix}'. Semver attempt: '{version_str_for_parse}'") # Changed to info
+            logger.info(f"Matched directory: '{dirname}'. Name: '{name}', Raw Version parts: M={major},m={minor},p={patch},suf='{suffix}'. Attempting to parse as semver: '{version_str_for_parse}'")
 
             try:
                 version = semver.VersionInfo.parse(version_str_for_parse)
-                if name not in packages or version > packages[name]["version_info"]:
+                # Successfully parsed as semver
+                # This semver version wins if:
+                # 1. Package not seen before.
+                # 2. Current semver is newer than stored semver.
+                # 3. Stored version was non-semver (semver always trumps non-semver).
+                if (name not in packages or
+                        packages[name].get("version_info") is None or  # Stored is non-semver
+                        version > packages[name]["version_info"]):     # Stored is older semver
                     packages[name] = {
                         "version_info": version,
                         "version_str": str(version), # Store the normalized semver string
-                        "dir": dirname # Original directory name, e.g., gstreamer.0.3.0
+                        "dir": dirname
                     }
-                    logger.info(f"Accepted/Updated package: {name} with version {str(version)} from dir {dirname}") # Changed to info
+                    logger.info(f"Accepted/Updated package: {name} with semver version {str(version)} from dir {dirname}")
             except ValueError:
-                logger.warning(f"Could not parse version '{version_str_for_parse}' for package '{name}' from dir '{dirname}'. Skipping this directory.")
+                # Failed to parse as semver
+                logger.warning(f"Could not parse version '{version_str_for_parse}' for package '{name}' from dir '{dirname}' as semver. Will consider it as a non-semver candidate.")
+                
+                # This non-semver version is taken if:
+                # 1. Package not seen before.
+                # 2. Stored version is also non-semver (effectively, last non-semver seen wins).
+                if name not in packages or packages[name].get("version_info") is None:
+                    packages[name] = {
+                        "version_info": None, # Mark as non-semver
+                        "version_str": version_str_for_parse, # Store the original string that failed parsing
+                        "dir": dirname
+                    }
+                    if name not in packages or packages[name].get("dir") != dirname : # Log if it's a new addition or an update of a non-semver
+                         logger.info(f"Accepted/Updated package: {name} with non-semver version '{version_str_for_parse}' from dir {dirname} (no valid semver version found or replacing previous non-semver).")
         # else:
-            # logger.debug(f"Directory '{dirname}' did not match package pattern.") # This can remain debug as it's very verbose
+            # logger.debug(f"Directory '{dirname}' did not match package pattern.")
             
     logger.info(f"Scanned {dir_count} directories, {matched_count} matched package pattern.")
     logger.info(f"Found {len(packages)} unique highest package versions.")
