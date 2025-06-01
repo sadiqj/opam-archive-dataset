@@ -2,6 +2,7 @@
 import os
 import re
 import tarfile
+import zipfile # Added for zip file support
 import tempfile
 import glob
 import logging
@@ -55,37 +56,78 @@ def setup_logging(level=logging.INFO):
 
 def process_archive_file(archive_path, processor_func, file_extensions=('ml', 'mli', 'dune', 'h', 'c', 'opam')):
     """
-    Process files in a tar archive (tbz, tgz) without storing all contents in memory.
-    Uses 'r:*' to auto-detect compression.
+    Process files in a tar (tbz, tgz, tar.gz, tar.bz2) or zip archive 
+    without storing all contents in memory.
+    For tar files, uses 'r:*' to auto-detect compression.
     """
-    try:
-        with tarfile.open(archive_path, 'r:*') as tar: # Auto-detect compression
-            for member in tar.getmembers():
-                if not member.isfile():
-                    continue
-                
-                _, ext = os.path.splitext(member.name)
-                ext = ext.lstrip('.')
-                
-                if os.path.basename(member.name) == 'dune':
-                    ext = 'dune'
-                
-                if ext in file_extensions:
-                    try:
-                        file_obj = tar.extractfile(member)
-                        if file_obj:
-                            content = file_obj.read()
+    archive_type = None
+    if archive_path.endswith('.zip'):
+        archive_type = 'zip'
+    elif archive_path.endswith(('.tar.gz', '.tgz', '.tar.bz2', '.tbz')):
+        archive_type = 'tar'
+    else:
+        logger.error(f"Unsupported archive format for {archive_path}")
+        return
+
+    if archive_type == 'zip':
+        try:
+            with zipfile.ZipFile(archive_path, 'r') as zf:
+                for member_info in zf.infolist():
+                    if member_info.is_dir(): # Skip directories
+                        continue
+                    
+                    file_path_in_archive = member_info.filename
+                    _, ext = os.path.splitext(file_path_in_archive)
+                    ext = ext.lstrip('.')
+                    
+                    if os.path.basename(file_path_in_archive) == 'dune':
+                        ext = 'dune'
+                    
+                    if ext in file_extensions:
+                        try:
+                            content = zf.read(member_info.filename)
                             try:
                                 content = content.decode('utf-8')
                             except UnicodeDecodeError:
                                 content = str(content) # Store as string representation of bytes
-                            processor_func(ext, member.name, content)
-                    except Exception as e:
-                        logger.error(f"Error extracting {member.name} from {archive_path}: {str(e)}")
-    except tarfile.ReadError as e:
-        logger.error(f"Error reading archive {archive_path} (possibly corrupted or wrong format): {str(e)}")
-    except Exception as e:
-        logger.error(f"Generic error processing archive {archive_path}: {str(e)}")
+                            processor_func(ext, file_path_in_archive, content)
+                        except Exception as e:
+                            logger.error(f"Error extracting {file_path_in_archive} from ZIP {archive_path}: {str(e)}")
+        except zipfile.BadZipFile as e:
+            logger.error(f"Error reading ZIP archive {archive_path} (bad ZIP file): {str(e)}")
+        except Exception as e:
+            logger.error(f"Generic error processing ZIP archive {archive_path}: {str(e)}")
+
+    elif archive_type == 'tar':
+        try:
+            with tarfile.open(archive_path, 'r:*') as tar: # Auto-detect compression
+                for member in tar.getmembers():
+                    if not member.isfile():
+                        continue
+                    
+                    file_path_in_archive = member.name
+                    _, ext = os.path.splitext(file_path_in_archive)
+                    ext = ext.lstrip('.')
+                    
+                    if os.path.basename(file_path_in_archive) == 'dune':
+                        ext = 'dune'
+                    
+                    if ext in file_extensions:
+                        try:
+                            file_obj = tar.extractfile(member)
+                            if file_obj:
+                                content = file_obj.read()
+                                try:
+                                    content = content.decode('utf-8')
+                                except UnicodeDecodeError:
+                                    content = str(content) # Store as string representation of bytes
+                                processor_func(ext, file_path_in_archive, content)
+                        except Exception as e:
+                            logger.error(f"Error extracting {file_path_in_archive} from TAR {archive_path}: {str(e)}")
+        except tarfile.ReadError as e:
+            logger.error(f"Error reading TAR archive {archive_path} (possibly corrupted or wrong format): {str(e)}")
+        except Exception as e:
+            logger.error(f"Generic error processing TAR archive {archive_path}: {str(e)}")
 
 def extract_metadata_from_archive(archive_path, package_base_name):
     """
@@ -218,16 +260,19 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
         else:
             logger.warning(f"Package directory {package_version_full_path} not found or is not a directory when trying to list contents.")
 
-        # Glob for .tbz and .tgz files
+        # Glob for .tbz, .tgz, .tar.gz, .tar.bz2 and .zip files
         archive_files = glob.glob(os.path.join(package_version_full_path, '*.tbz'))
         archive_files.extend(glob.glob(os.path.join(package_version_full_path, '*.tgz')))
+        archive_files.extend(glob.glob(os.path.join(package_version_full_path, '*.tar.gz')))
+        archive_files.extend(glob.glob(os.path.join(package_version_full_path, '*.tar.bz2')))
+        archive_files.extend(glob.glob(os.path.join(package_version_full_path, '*.zip')))
 
         if not archive_files:
-            logger.warning(f"No .tbz or .tgz archives found in {package_version_full_path} for package {package_name} {version_str}. This package version will be skipped.")
+            logger.warning(f"No .tbz, .tgz, .tar.gz, .tar.bz2, or .zip archives found in {package_version_full_path} for package {package_name} {version_str}. This package version will be skipped.")
             package_data.append({
                 "package_name": package_name, "version": version_str,
                 "license": "Skipped", "homepage": "Skipped", "dev_repo": "Skipped",
-                "files": [], "error": "No .tbz or .tgz archive found"
+                "files": [], "error": "No .tbz, .tgz, .tar.gz, .tar.bz2, or .zip archive found"
             })
             skipped_no_archive_count += 1
             continue
