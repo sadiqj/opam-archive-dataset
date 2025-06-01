@@ -248,10 +248,11 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
 
     logger.info(f"Total unique package versions selected for processing: {len(packages_to_process)}")
 
-    package_data = []
+    file_data = []  # Changed from package_data to file_data - will hold one entry per file
     processed_count = 0
     skipped_no_archive_count = 0
     skipped_empty_archive_count = 0
+    total_files_count = 0
 
     for package_name, package_info in tqdm(packages_to_process.items(), desc="Processing packages"):
         # Log the package key and its associated info (which includes the directory name)
@@ -262,7 +263,7 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
         
         logger.info(f"Starting processing for package: {package_name} (version: {version_str}, specific source dir in cache: {package_dir_name})")
 
-        current_package_contents = []
+        current_package_files = []  # Temporary list to count files per package
         package_metadata = {
             "license": "Unknown", "homepage": "Unknown", "dev_repo": "Unknown",
             "processed_opam_file_for_metadata": False
@@ -289,11 +290,6 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
 
         if not archive_files:
             logger.warning(f"No .tbz, .tgz, .tar.gz, .tar.bz2, or .zip archives found in {package_version_full_path} for package {package_name} {version_str}. This package version will be skipped.")
-            package_data.append({
-                "package_name": package_name, "version": version_str,
-                "license": "Skipped", "homepage": "Skipped", "dev_repo": "Skipped",
-                "files": [], "error": "No .tbz, .tgz, .tar.gz, .tar.bz2, or .zip archive found"
-            })
             skipped_no_archive_count += 1
             continue
 
@@ -329,38 +325,36 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
             
             # Define a collector function for this archive's contents
             def content_collector(file_type, file_path_in_archive, content):
-                current_package_contents.append({
+                # Instead of collecting to a temporary list, directly append to file_data
+                file_data.append({
+                    "package_name": package_name,
+                    "version": version_str,
+                    "license": package_metadata["license"],
+                    "homepage": package_metadata["homepage"],
+                    "dev_repo": package_metadata["dev_repo"],
                     "file_type": file_type,
-                    "file_path": file_path_in_archive, # Path within the archive
-                    "content": content
+                    "file_path": file_path_in_archive,
+                    "file_content": content
                 })
+                # Also add to current_package_files for counting
+                current_package_files.append(file_path_in_archive)
 
-            logger.info(f"Extracting contents from: {archive_path}") # Changed to info
+            logger.info(f"Extracting contents from: {archive_path}")
             process_archive_file(archive_path, content_collector)
         
         # After processing all archives for this package version
-        if not current_package_contents:
+        if not current_package_files:
             logger.warning(f"No processable files (ml, mli, etc.) found in any archives for {package_name} {version_str} in {package_version_full_path}.")
-            # Still add an entry, it might have metadata, or we need to record it was empty
-            package_data.append({
-                "package_name": package_name, "version": version_str,
-                "license": package_metadata["license"], "homepage": package_metadata["homepage"], "dev_repo": package_metadata["dev_repo"],
-                "files": [], "error": "Archives found but contained no processable files"
-            })
-            skipped_empty_archive_count +=1
+            skipped_empty_archive_count += 1
         else:
-            package_data.append({
-                "package_name": package_name, "version": version_str,
-                "license": package_metadata["license"], "homepage": package_metadata["homepage"], "dev_repo": package_metadata["dev_repo"],
-                "files": current_package_contents
-            })
-            processed_count +=1
-            logger.info(f"Finished processing for {package_name} {version_str}. Total files extracted: {len(current_package_contents)}")
+            processed_count += 1
+            total_files_count += len(current_package_files)
+            logger.info(f"Finished processing for {package_name} {version_str}. Total files extracted: {len(current_package_files)}")
 
-    logger.info(f"Finished processing all packages. Successfully processed: {processed_count}, Skipped (no archive): {skipped_no_archive_count}, Skipped (empty/no processable files): {skipped_empty_archive_count}")
+    logger.info(f"Finished processing all packages. Successfully processed: {processed_count} packages with {total_files_count} files, Skipped (no archive): {skipped_no_archive_count}, Skipped (empty/no processable files): {skipped_empty_archive_count}")
 
     # Convert to Hugging Face Dataset
-    if not package_data:
+    if not file_data:
         logger.warning("No data collected from packages. Skipping dataset creation and upload.")
         return
 
@@ -370,16 +364,16 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
         logger.info(f"Created output directory: {output_dir}")
 
     # Convert list of dicts to a dict of lists for Dataset.from_dict
-    # Handle potential missing 'error' key
     data_dict = defaultdict(list)
-    for item in package_data:
+    for item in file_data:
         data_dict["package_name"].append(item.get("package_name"))
         data_dict["version"].append(item.get("version"))
         data_dict["license"].append(item.get("license"))
         data_dict["homepage"].append(item.get("homepage"))
         data_dict["dev_repo"].append(item.get("dev_repo"))
-        data_dict["files"].append(item.get("files")) # files is a list of dicts
-        data_dict["error"].append(item.get("error", None)) # Add error field, default to None
+        data_dict["file_type"].append(item.get("file_type"))
+        data_dict["file_path"].append(item.get("file_path"))
+        data_dict["file_content"].append(item.get("file_content"))
 
     try:
         dataset = Dataset.from_dict(data_dict)
@@ -390,10 +384,7 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
         logger.error("Data structure that failed:")
         for key, value_list in data_dict.items():
             logger.error(f"  {key}: list of {len(value_list)} items. First item type: {type(value_list[0]) if value_list else 'N/A'}")
-            if key == "files" and value_list and isinstance(value_list[0], list) and value_list[0]:
-                 logger.error(f"    First item in 'files' list is a list of {len(value_list[0])} dicts. Keys of first dict: {value_list[0][0].keys() if value_list[0] else 'N/A'}")
         return
-
 
     # Save to Parquet in batches
     # Calculate number of batches
