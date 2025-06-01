@@ -147,7 +147,7 @@ def extract_metadata_from_archive(archive_path, package_base_name):
     def process_opam_file(file_type, file_path, content):
         # Check if the filename (basename) matches 'opam' or 'package_name.opam'
         if file_type == 'opam' and opam_file_pattern.match(os.path.basename(file_path)):
-            logger.info(f"Processing opam file: {file_path} in archive {archive_path}") # Changed to info
+            logger.debug(f"Processing opam file: {file_path} in archive {archive_path}")
             # Simple line-by-line parsing for opam fields
             for line in content.splitlines():
                 line = line.strip()
@@ -157,7 +157,7 @@ def extract_metadata_from_archive(archive_path, package_base_name):
                     metadata["homepage"] = line.split(":", 1)[1].strip().strip('"')
                 elif line.startswith("dev-repo:") or line.startswith("dev-repo :"):
                     metadata["dev_repo"] = line.split(":", 1)[1].strip().strip('"')
-            logger.info(f"Metadata from {file_path}: {metadata}") # Changed to info
+            logger.debug(f"Metadata from {file_path}: {metadata}")
 
     # Use process_archive_file to find and process opam files
     # We only care about 'opam' extension here for metadata extraction.
@@ -170,7 +170,7 @@ def get_packages_from_cache(cache_path):
         logger.error(f"Cache directory {cache_path} not found.")
         return packages
 
-    logger.info(f"Scanning cache directory: {cache_path}")
+    logger.debug(f"Scanning cache directory: {cache_path}")
     dir_count = 0
     matched_count = 0
     for dirname in os.listdir(cache_path):
@@ -192,7 +192,7 @@ def get_packages_from_cache(cache_path):
             if suffix.startswith("~"): # semver library expects '-' for pre-release, not '~'
                 version_str_for_parse = f"{major}.{minor}.{patch}-{suffix[1:]}"
             
-            logger.info(f"Matched directory: '{dirname}'. Name: '{name}', Raw Version parts: M={major},m={minor},p={patch},suf='{suffix}'. Attempting to parse as semver: '{version_str_for_parse}'")
+            logger.debug(f"Matched directory: '{dirname}'. Name: '{name}', Raw Version parts: M={major},m={minor},p={patch},suf='{suffix}'. Attempting to parse as semver: '{version_str_for_parse}'")
 
             try:
                 version = semver.VersionInfo.parse(version_str_for_parse)
@@ -209,7 +209,7 @@ def get_packages_from_cache(cache_path):
                         "version_str": str(version), # Store the normalized semver string
                         "dir": dirname
                     }
-                    logger.info(f"Accepted/Updated package: {name} with semver version {str(version)} from dir {dirname}")
+                    logger.debug(f"Accepted/Updated package: {name} with semver version {str(version)} from dir {dirname}")
             except ValueError:
                 # Failed to parse as semver
                 logger.warning(f"Could not parse version '{version_str_for_parse}' for package '{name}' from dir '{dirname}' as semver. Will consider it as a non-semver candidate.")
@@ -224,14 +224,14 @@ def get_packages_from_cache(cache_path):
                         "dir": dirname
                     }
                     if name not in packages or packages[name].get("dir") != dirname : # Log if it's a new addition or an update of a non-semver
-                         logger.info(f"Accepted/Updated package: {name} with non-semver version '{version_str_for_parse}' from dir {dirname} (no valid semver version found or replacing previous non-semver).")
+                         logger.debug(f"Accepted/Updated package: {name} with non-semver version '{version_str_for_parse}' from dir {dirname} (no valid semver version found or replacing previous non-semver).")
         # else:
-            # logger.debug(f"Directory '{dirname}' did not match package pattern.")
+            # logger.debug(f"Directory '{dirname}' did not match package pattern.") # This can remain debug as it's very verbose
             
-    logger.info(f"Scanned {dir_count} directories, {matched_count} matched package pattern.")
-    logger.info(f"Found {len(packages)} unique highest package versions.")
+    logger.debug(f"Scanned {dir_count} directories, {matched_count} matched package pattern.")
+    logger.debug(f"Found {len(packages)} unique highest package versions.")
     if packages:
-        logger.info(f"First 5 packages found (name, info): {list(packages.items())[:5]}") # Changed to info
+        logger.debug(f"First 5 packages found (name, info): {list(packages.items())[:5]}")
     return packages
 
 def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', batch_size=1000, log_level_str="INFO"):
@@ -256,12 +256,12 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
 
     for package_name, package_info in tqdm(packages_to_process.items(), desc="Processing packages"):
         # Log the package key and its associated info (which includes the directory name)
-        logger.info(f"Loop iteration for package key: '{package_name}'. Associated info from cache scan: {package_info}")
+        logger.debug(f"Loop iteration for package key: '{package_name}'. Associated info from cache scan: {package_info}")
 
         version_str = package_info["version_str"]
         package_dir_name = package_info["dir"] # This is the original directory name like 'gstreamer.0.3.0'
         
-        logger.info(f"Starting processing for package: {package_name} (version: {version_str}, specific source dir in cache: {package_dir_name})")
+        logger.debug(f"Starting processing for package: {package_name} (version: {version_str}, specific source dir in cache: {package_dir_name})")
 
         current_package_files = []  # Temporary list to count files per package
         package_metadata = {
@@ -275,7 +275,7 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
         if os.path.isdir(package_version_full_path):
             try:
                 dir_contents = os.listdir(package_version_full_path)
-                logger.info(f"Contents of directory {package_version_full_path}: {dir_contents}")
+                logger.debug(f"Contents of directory {package_version_full_path}: {dir_contents}")
             except OSError as e:
                 logger.error(f"Could not list contents of directory {package_version_full_path}: {e}")
         else:
@@ -293,10 +293,10 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
             skipped_no_archive_count += 1
             continue
 
-        logger.info(f"Found {len(archive_files)} archive(s) in {package_version_full_path}: {archive_files}")
+        logger.debug(f"Found {len(archive_files)} archive(s) in {package_version_full_path}: {archive_files}")
 
         for archive_path in archive_files:
-            logger.info(f"Processing archive file: {archive_path} for package {package_name} {version_str}")
+            logger.debug(f"Processing archive file: {archive_path} for package {package_name} {version_str}")
 
             archive_name_for_meta_lookup = package_name # Default to package_name from directory
             archive_filename_base = os.path.basename(archive_path)
@@ -309,7 +309,7 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
             if meta_name_match:
                 potential_name_from_archive = meta_name_match.group(1)
                 if potential_name_from_archive and potential_name_from_archive != package_name:
-                    logger.info(f"Archive filename '{archive_filename_base}' suggests base name '{potential_name_from_archive}' for metadata lookup, differing from dir-derived name '{package_name}'. Using '{potential_name_from_archive}' for opam file lookup within this archive.")
+                    logger.debug(f"Archive filename '{archive_filename_base}' suggests base name '{potential_name_from_archive}' for metadata lookup, differing from dir-derived name '{package_name}'. Using '{potential_name_from_archive}' for opam file lookup within this archive.")
                     archive_name_for_meta_lookup = potential_name_from_archive
                 elif not potential_name_from_archive:
                     logger.warning(f"Could not reliably determine base name from archive '{archive_filename_base}' for metadata. Defaulting to dir-derived name '{package_name}'.")
@@ -319,9 +319,9 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
                 if any(current_archive_metadata[k] != "Unknown" for k in ["license", "homepage", "dev_repo"]):
                     package_metadata.update(current_archive_metadata)
                     package_metadata["processed_opam_file_for_metadata"] = True
-                    logger.info(f"Updated metadata (source: {archive_name_for_meta_lookup}.opam or opam in {archive_filename_base}): License='{package_metadata['license']}', Homepage='{package_metadata['homepage']}', DevRepo='{package_metadata['dev_repo']}'")
+                    logger.debug(f"Updated metadata (source: {archive_name_for_meta_lookup}.opam or opam in {archive_filename_base}): License='{package_metadata['license']}', Homepage='{package_metadata['homepage']}', DevRepo='{package_metadata['dev_repo']}'")
                 else:
-                    logger.info(f"No new metadata found in opam file (related to '{archive_name_for_meta_lookup}') within {archive_filename_base}")
+                    logger.debug(f"No new metadata found in opam file (related to '{archive_name_for_meta_lookup}') within {archive_filename_base}")
             
             # Define a collector function for this archive's contents
             def content_collector(file_type, file_path_in_archive, content):
@@ -339,7 +339,7 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
                 # Also add to current_package_files for counting
                 current_package_files.append(file_path_in_archive)
 
-            logger.info(f"Extracting contents from: {archive_path}")
+            logger.debug(f"Extracting contents from: {archive_path}")
             process_archive_file(archive_path, content_collector)
         
         # After processing all archives for this package version
@@ -349,7 +349,7 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
         else:
             processed_count += 1
             total_files_count += len(current_package_files)
-            logger.info(f"Finished processing for {package_name} {version_str}. Total files extracted: {len(current_package_files)}")
+            logger.debug(f"Finished processing for {package_name} {version_str}. Total files extracted: {len(current_package_files)}")
 
     logger.info(f"Finished processing all packages. Successfully processed: {processed_count} packages with {total_files_count} files, Skipped (no archive): {skipped_no_archive_count}, Skipped (empty/no processable files): {skipped_empty_archive_count}")
 
@@ -361,7 +361,7 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
     # Create output directory if it doesn't exist
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-        logger.info(f"Created output directory: {output_dir}")
+        logger.debug(f"Created output directory: {output_dir}")
 
     # Convert list of dicts to a dict of lists for Dataset.from_dict
     data_dict = defaultdict(list)
@@ -400,7 +400,7 @@ def main(cache_path='/cache/', output_dir='/root/opam-archive-dataset/data', bat
             # table = pa.Table.from_pandas(df)
             # pq.write_table(table, parquet_file_path)
             batch_dataset.to_parquet(parquet_file_path) # Simpler if it works
-            logger.info(f"Successfully saved batch {i} to {parquet_file_path}")
+            logger.debug(f"Successfully saved batch {i} to {parquet_file_path}")
         except Exception as e:
             logger.error(f"Error saving batch {i} to Parquet: {str(e)}")
             # Consider alternative saving or logging more details
